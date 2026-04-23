@@ -295,6 +295,222 @@ async function run() {
   log("═══════════════════════════════════════\n");
 }
 
+// ── REPLY ─────────────────────────────────────────────────────────────────────
+async function reply(targetUsername) {
+  log("═══════════════════════════════════════");
+  log(`Simcluster Agent — replying to @${targetUsername}`);
+
+  const token = loadBearer();
+  if (!token) { log("❌ Run setup first."); process.exit(1); }
+  if (!targetUsername) {
+    log("❌ Usage: node simcluster-agent.js reply <username>");
+    return;
+  }
+
+  // ── 1. Session check ─────────────────────────────
+  const sess = await mcp("agent.sessionStatus", {}, token);
+  if (!sess.ok) { log("❌ Session failed."); return; }
+
+  const postsRemaining = sess.parsed?.player?.dailyPosts?.remaining ?? 5;
+  log(`Posts remaining: ${postsRemaining}`);
+  if (postsRemaining <= 0) {
+    log("⚠️ Daily limit reached.");
+    return;
+  }
+
+  // ── 2. Resolve concept ───────────────────────────
+  log(`Resolving concept: ${CONCEPT_SLUG}`);
+  const conceptRes = await mcp("create.getConceptShortIds", { slugs: [CONCEPT_SLUG] }, token);
+
+  let conceptShortId = null;
+  try {
+    const p = conceptRes.parsed;
+    conceptShortId = Array.isArray(p) ? p[0] : Object.values(p || {})[0];
+  } catch {}
+
+  if (!conceptShortId) {
+    log("❌ Failed to resolve concept.");
+    return;
+  }
+
+  log(`Concept shortId: ${conceptShortId}`);
+
+  // ── 3. Search user (best effort) ─────────────────
+  log(`Searching for user: ${targetUsername}`);
+  const searchRes = await mcp("search.search", { query: targetUsername }, token);
+
+  let charShortId = null;
+
+  try {
+    const rawText = searchRes.raw?.result?.content?.[0]?.text;
+    const parsed = rawText ? JSON.parse(rawText) : searchRes.parsed;
+
+    const users = Array.isArray(parsed) ? parsed : [];
+
+    const match = users.find(u =>
+      (u.username || "").toLowerCase() === targetUsername.toLowerCase()
+    );
+
+    charShortId =
+      match?.shortId ||
+      match?.charShortId ||
+      match?.id ||
+      match?.userId ||
+      null;
+
+  } catch (e) {
+    log("Search parse error: " + e.message);
+  }
+
+  if (charShortId) {
+    log(`Found charShortId: ${charShortId}`);
+  } else {
+    log("⚠️ Could not extract charShortId — using fallback.");
+  }
+
+  // ── 4. Get latest post ───────────────────────────
+  let latestPostShortId = null;
+
+  // ✅ PRIMARY: timeline (if ID exists)
+  if (charShortId) {
+    log("Fetching user timeline...");
+    const timelineRes = await mcp("posts.getCharacterTimelineFeed", {
+      charShortIds: [charShortId],
+      limit: 1
+    }, token);
+
+    log("Timeline raw: " + timelineRes.text.slice(0, 200));
+
+    try {
+      const rawText = timelineRes.raw?.result?.content?.[0]?.text;
+      const parsed = rawText ? JSON.parse(rawText) : timelineRes.parsed;
+
+      const posts = Array.isArray(parsed)
+        ? parsed
+        : (parsed?.posts || parsed?.items || []);
+
+      if (posts.length > 0) {
+        latestPostShortId =
+          posts[0]?.shortId ||
+          posts[0]?.short_id ||
+          posts[0]?.id;
+      }
+
+    } catch (e) {
+      log("Timeline parse error: " + e.message);
+    }
+  }
+
+  // ⚠️ FALLBACK: global feed
+  if (!latestPostShortId) {
+    log("Fallback: scanning global feed...");
+    const feedRes = await mcp("posts.getPostFeed", {
+      limit: 50,
+      orderBy: "created_at"
+    }, token);
+
+    log("Feed raw: " + feedRes.text.slice(0, 200));
+
+    try {
+      const rawText = feedRes.raw?.result?.content?.[0]?.text;
+      const parsed = rawText ? JSON.parse(rawText) : feedRes.parsed;
+
+      const posts = Array.isArray(parsed)
+        ? parsed
+        : (parsed?.posts || parsed?.items || []);
+
+      log(`Fetched ${posts.length} posts. Scanning for @${targetUsername}...`);
+
+      const match = posts.find(p => {
+        const possibleNames = [
+          p?.author?.username,
+          p?.author?.name,
+          p?.character?.username,
+          p?.char?.username,
+          p?.username
+        ]
+          .filter(Boolean)
+          .map(v => v.toLowerCase());
+
+        return possibleNames.includes(targetUsername.toLowerCase());
+      });
+
+      if (match) {
+        latestPostShortId =
+          match.shortId ||
+          match.short_id ||
+          match.id;
+      }
+
+    } catch (e) {
+      log("Feed parse error: " + e.message);
+    }
+  }
+
+  if (!latestPostShortId) {
+    log("❌ Could not find a post to reply to.");
+    return;
+  }
+
+  log(`Replying to post: ${latestPostShortId}`);
+
+  // ── 5. Generate reply ────────────────────────────
+  log("Generating reply...");
+  const replyRes = await mcp("create.replyCompletion", {
+    replyToShortId: latestPostShortId,
+    conceptShortIds: [conceptShortId]
+  }, token);
+
+  log("Reply raw: " + replyRes.text.slice(0, 200));
+
+  let replyTextShortId = null;
+
+  try {
+    const rawText = replyRes.raw?.result?.content?.[0]?.text;
+
+    if (rawText) {
+      replyTextShortId = JSON.parse(rawText).shortId;
+    }
+
+    if (!replyTextShortId) {
+      replyTextShortId =
+        replyRes.parsed?.shortId ||
+        replyRes.parsed?.textCompletionShortId;
+    }
+
+  } catch (e) {
+    log("Reply parse error: " + e.message);
+  }
+
+  if (!replyTextShortId) {
+    log("❌ Could not extract reply shortId.");
+    return;
+  }
+
+  log(`replyTextShortId: ${replyTextShortId}`);
+
+  // ── 6. Post reply ────────────────────────────────
+  log("Posting reply...");
+  const postRes = await mcp("create.createPostReply", {
+    replyToShortId: latestPostShortId,
+    textCompletionShortId: replyTextShortId
+  }, token);
+
+  log("Post result: " + postRes.text.slice(0, 200));
+
+  const failed = ["error", "invalid", "unrecognized", "failed"].some(w =>
+    postRes.text.toLowerCase().includes(w)
+  );
+
+  if (failed) {
+    log("❌ Reply failed.");
+    return;
+  }
+
+  log(`✅ Reply posted to @${targetUsername}!`);
+  log("═══════════════════════════════════════\n");
+}
+
 // ── STATUS ────────────────────────────────────────────────────────────────────
 async function status() {
   const token = loadBearer();
@@ -320,17 +536,19 @@ function installCron() {
   switch (cmd) {
     case "setup":   await setup(); break;
     case "run":     await run(); break;
+    case "reply":   await reply(process.argv[3]); break;
     case "profile": { const t = loadBearer(); if (!t) log("Run setup first."); else await setupProfile(t); break; }
     case "status":  await status(); break;
     case "cron":    installCron(); break;
     default:
       console.log(`
 Simcluster Agent — Usage:
-  node simcluster-agent.js setup      Link account, set name, enable
-  node simcluster-agent.js run        Daily post cycle
-  node simcluster-agent.js profile    Fix name / username / bio
-  node simcluster-agent.js status     Check session & clout
-  node simcluster-agent.js cron       Print cron install instructions
+  node simcluster-agent.js setup            Link account, set name, enable
+  node simcluster-agent.js run              Daily post cycle
+  node simcluster-agent.js reply <username> Reply to a user's latest post
+  node simcluster-agent.js profile          Fix name / username / bio
+  node simcluster-agent.js status           Check session & clout
+  node simcluster-agent.js cron             Print cron install instructions
       `);
   }
 })().catch(e => { log("Fatal: " + e.message); process.exit(1); });
