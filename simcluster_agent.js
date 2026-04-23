@@ -530,10 +530,103 @@ function installCron() {
   console.log(`  (crontab -l 2>/dev/null; echo "${cronLine}") | crontab -\n`);
 }
 
+
+// ── TIME CONSTANTS ─────────────────────────────────────────────
+const SIX_HOURS = 6 * 60 * 60 * 1000;
+
+// ── SAFE SLEEP WRAPPER ─────────────────────────────────────────
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ── ASK WITH TIMEOUT ───────────────────────────────────────────
+function askWithTimeout(prompt, timeoutMs = 60000) {
+  return new Promise(resolve => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    let done = false;
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      rl.close();
+      log("⏱️ No input — auto-skipping...");
+      resolve(null);
+    }, timeoutMs);
+
+    rl.question(prompt, answer => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+// ── SAFE RUN WRAPPER ───────────────────────────────────────────
+async function safeRun(fn, label) {
+  try {
+    log(`▶️ Running: ${label}`);
+    await fn();
+    log(`✅ Completed: ${label}`);
+  } catch (e) {
+    log(`❌ Failed: ${label} → ${e.message}`);
+  }
+}
+
+// ── AUTO LOOP ──────────────────────────────────────────────────
+async function auto() {
+  log("═══════════════════════════════════════");
+  log("Simcluster Agent — AUTO MODE (6-hour cycle)");
+
+  while (true) {
+    try {
+      // STEP 1: SETUP
+      const setupAns = await askWithTimeout("Run setup? (y/N): ");
+      if (setupAns?.toLowerCase() === "y") {
+        await safeRun(setup, "setup");
+      } else {
+        log("⏭️ Skipping setup...");
+      }
+
+      // STEP 2: PROFILE
+      const token = loadBearer();
+      if (token) {
+        const profileAns = await askWithTimeout("Update profile? (y/N): ");
+        if (profileAns?.toLowerCase() === "y") {
+          await safeRun(() => setupProfile(token), "profile");
+        } else {
+          log("⏭️ Skipping profile...");
+        }
+      }
+
+      // STEP 3: MAIN POST
+      await safeRun(run, "run");
+
+      // STEP 4: AUTO REPLY (hardcoded)
+      await safeRun(() => reply("mztacat"), "reply @mztacat");
+
+      // STEP 5: STATUS CHECK
+      await safeRun(status, "status");
+
+    } catch (err) {
+      log("❌ Auto loop error: " + err.message);
+    }
+
+    // ── CLEAN 6 HOUR SLEEP ─────────────────────────────────────
+    log("⏳ Sleeping for 6 hours...");
+    await sleep(SIX_HOURS);
+  }
+}
 // ── Entry ─────────────────────────────────────────────────────────────────────
 (async () => {
   const cmd = process.argv[2];
   switch (cmd) {
+    case "auto": await auto(); break;
     case "setup":   await setup(); break;
     case "run":     await run(); break;
     case "reply":   await reply(process.argv[3]); break;
